@@ -9,6 +9,8 @@
 
 mod ls_util;
 
+use ftw::{metadata, symlink_metadata, Metadata};
+
 use self::ls_util::{ls_from_utf8_lossy, Entry, LongFormatPadding, MultiColumnPadding};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
@@ -927,8 +929,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
     // Files get processed first
     let mut file_entries = Vec::new();
     for path in files {
-        let path_cstr = CString::new(path.as_os_str().as_bytes()).unwrap();
-        let metadata = match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, false) {
+        let meta = match symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("ls: {e}");
@@ -946,8 +947,8 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
 
         // If -H or -L are enabled, the metadata to be reported is from the file
         // that the symbolic link points to.
-        let metadata = if metadata.is_symlink() && dereference_symlink {
-            match ftw::Metadata::new(libc::AT_FDCWD, &path_cstr, true) {
+        let metadata = if meta.is_symlink() && dereference_symlink {
+            match metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
                     eprintln!("ls: {e}");
@@ -956,7 +957,7 @@ fn ls(paths: Vec<PathBuf>, config: &Config) -> io::Result<u8> {
                 }
             }
         } else {
-            metadata
+            meta
         };
 
         // Target of the symlink
@@ -1115,18 +1116,17 @@ fn process_single_dir(
 
             // Get the metadata of the file, equivalent to `std::fs::symlink_metadata`
             let marker = {
-                let metadata =
-                    match ftw::Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false) {
-                        Ok(md) => md,
-                        Err(e) => {
-                            let path_str = ls_from_utf8_lossy(
-                                dir_entry.path().as_inner().as_os_str().as_bytes(),
-                            );
-                            let err_str = gettext!("cannot access '{}': {}", path_str, e);
-                            errors.push(io::Error::other(err_str));
-                            return Ok(false);
-                        }
-                    };
+                let metadata = match Metadata::new(dir_entry.dir_fd(), dir_entry.file_name(), false)
+                {
+                    Ok(md) => md,
+                    Err(e) => {
+                        let path_str =
+                            ls_from_utf8_lossy(dir_entry.path().as_inner().as_os_str().as_bytes());
+                        let err_str = gettext!("cannot access '{}': {}", path_str, e);
+                        errors.push(io::Error::other(err_str));
+                        return Ok(false);
+                    }
+                };
                 (metadata.dev(), metadata.ino())
             };
 

@@ -9,13 +9,13 @@
 
 mod common;
 
+use ftw::{symlink_metadata, traverse_directory};
+
 use self::common::error_string;
 use clap::Parser;
-use ftw::{self, traverse_directory};
 use gettextrs::{bind_textdomain_codeset, gettext, setlocale, textdomain, LocaleCategory};
 use plib::PROJECT_NAME;
 use std::{
-    ffi::CString,
     fs,
     io::{self, IsTerminal},
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
@@ -390,8 +390,7 @@ fn rm_directory(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
 /// This function returns `Ok(true)` on success. This never returns `Ok(false)` and the function
 /// signature is only to match `rm_directory`.
 fn rm_file(cfg: &RmConfig, filepath: &Path) -> io::Result<bool> {
-    let filename_cstr = CString::new(filepath.as_os_str().as_bytes())?;
-    let metadata = ftw::Metadata::new(libc::AT_FDCWD, &filename_cstr, false)?;
+    let metadata = symlink_metadata(&filepath)?;
 
     if should_remove_file(cfg, &metadata, || display_cleaned(filepath)) {
         fs::remove_file(filepath).map_err(|e| {

@@ -1,6 +1,10 @@
 mod dir;
 
-use dir::{DeferredDir, HybridDir, OwnedDir};
+mod small_c_string;
+
+use crate::dir::{DeferredDir, HybridDir, OwnedDir};
+use crate::small_c_string::run_path_with_cstr;
+
 use std::{
     ffi::{CStr, CString, OsStr},
     fmt, io,
@@ -107,7 +111,30 @@ impl AsRawFd for FileDescriptor {
     }
 }
 
-/// Metadata of an entry. This is analogous to `std::fs::Metadata`.
+//todo stat
+//todo fstat
+
+/// Given a path, queries the file system to get information about a file,
+/// directory, etc.
+///
+/// This function will traverse symbolic links to query information about the
+/// destination file.
+///
+/// This is analogous to [`std::fs::metadata`].
+pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
+    run_path_with_cstr(path.as_ref(), &|p| Metadata::new(libc::AT_FDCWD, p, true))
+}
+
+/// Queries the metadata about a file without following symlinks.
+///
+/// This is analogous to [`std::fs::symlink_metadata`].
+pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
+    run_path_with_cstr(path.as_ref(), &|p| Metadata::new(libc::AT_FDCWD, p, false))
+}
+
+/// Metadata information about a file.
+///
+/// This is analogous to [`std::fs::Metadata`].
 #[derive(Clone)]
 pub struct Metadata(libc::stat);
 
@@ -118,40 +145,66 @@ impl fmt::Debug for Metadata {
 }
 
 impl Metadata {
-    /// Create a new `Metadata`.
+    /// Create a new [`Metadata`].
     ///
-    /// `dirfd` could be the special value `libc::AT_FDCWD` to query the metadata of a file at the
+    /// `dirfd` could be the special value [`libc::AT_FDCWD`] to query the metadata of a file at the
     /// process' current working directory.
-    pub fn new(
-        dirfd: libc::c_int,
-        file_name: &CStr,
-        follow_symlinks: bool,
-    ) -> io::Result<Metadata> {
-        let mut statbuf = MaybeUninit::uninit();
-        let flags = if follow_symlinks {
-            0
-        } else {
-            libc::AT_SYMLINK_NOFOLLOW
-        };
-        let ret = unsafe { libc::fstatat(dirfd, file_name.as_ptr(), statbuf.as_mut_ptr(), flags) };
+    pub fn new(dirfd: libc::c_int, pathname: &CStr, follow_symlinks: bool) -> io::Result<Metadata> {
+        let mut buf = MaybeUninit::uninit();
+        let mut flags = 0;
+        if !follow_symlinks {
+            flags |= libc::AT_SYMLINK_NOFOLLOW;
+        }
+        let ret = unsafe { libc::fstatat(dirfd, pathname.as_ptr(), buf.as_mut_ptr(), flags) };
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
-        Ok(Metadata(unsafe { statbuf.assume_init() }))
+        Ok(Metadata(unsafe { buf.assume_init() }))
     }
 
-    /// Query the file type.
+    /// Returns the file type for this metadata.
+    ///
+    /// This is analogous to [`std::fs::Metadata::file_type`].
     pub fn file_type(&self) -> FileType {
-        match self.0.st_mode & libc::S_IFMT {
-            libc::S_IFSOCK => FileType::Socket,
-            libc::S_IFLNK => FileType::SymbolicLink,
-            libc::S_IFREG => FileType::RegularFile,
-            libc::S_IFBLK => FileType::BlockDevice,
-            libc::S_IFDIR => FileType::Directory,
-            libc::S_IFCHR => FileType::CharacterDevice,
-            libc::S_IFIFO => FileType::Fifo,
-            _ => unreachable!(),
-        }
+        FileType::new(self.0.st_mode)
+    }
+
+    /// Returns `true` if this metadata is for a directory. The
+    /// result is mutually exclusive to the result of
+    /// [`Metadata::is_file`], and will be false for symlink metadata
+    /// obtained from [`symlink_metadata`].
+    ///
+    /// This is analogous to [`std::fs::Metadata::is_dir`].
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        self.file_type().is_dir()
+    }
+
+    /// Returns `true` if this metadata is for a regular file. The
+    /// result is mutually exclusive to the result of
+    /// [`Metadata::is_dir`], and will be false for symlink metadata
+    /// obtained from [`symlink_metadata`].
+    ///
+    /// This is analogous to [`std::fs::Metadata::is_file`].
+    #[must_use]
+    pub fn is_file(&self) -> bool {
+        self.file_type().is_file()
+    }
+
+    /// Returns `true` if this metadata is for a symbolic link.
+    ///
+    /// This is analogous to [`std::fs::Metadata::is_symlink`].
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        self.file_type().is_symlink()
+    }
+
+    /// Returns the size of the file, in bytes, this metadata is for.
+    ///
+    /// This is analogous to [`std::fs::Metadata::len`].
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.0.st_size as u64
     }
 
     // These are "effective" IDs and not "real" to allow for things like sudo
@@ -193,21 +246,6 @@ impl Metadata {
         } else {
             self.0.st_mode & libc::S_IXOTH != 0
         }
-    }
-
-    /// Returns `true` if this metadata is for a directory.
-    pub fn is_dir(&self) -> bool {
-        self.file_type().is_dir()
-    }
-
-    /// Returns `true` if this metadata is for a regular file.
-    pub fn is_file(&self) -> bool {
-        self.file_type().is_file()
-    }
-
-    /// Returns `true` if this metadata is for a symbolic link.
-    pub fn is_symlink(&self) -> bool {
-        self.file_type().is_symlink()
     }
 }
 
@@ -277,7 +315,10 @@ impl unix::fs::MetadataExt for Metadata {
     }
 }
 
-/// File type of an entry. Returned by `Metadata::file_type`.
+/// File type of an entry. Returned by [`Metadata::file_type`].
+///
+/// This is analogous to [`std::fs::FileType`].
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Socket,
@@ -290,19 +331,50 @@ pub enum FileType {
 }
 
 impl FileType {
-    /// Tests whether this file type represents a directory.
+    fn new(mode: libc::mode_t) -> Self {
+        match mode & libc::S_IFMT {
+            libc::S_IFSOCK => FileType::Socket,
+            libc::S_IFLNK => FileType::SymbolicLink,
+            libc::S_IFREG => FileType::RegularFile,
+            libc::S_IFBLK => FileType::BlockDevice,
+            libc::S_IFDIR => FileType::Directory,
+            libc::S_IFCHR => FileType::CharacterDevice,
+            libc::S_IFIFO => FileType::Fifo,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Tests whether this file type represents a directory. The
+    /// result is mutually exclusive to the results of
+    /// [`is_file`] and [`is_symlink`]; only zero or one of these
+    /// tests may pass.
+    ///
+    /// This is analogous to [`std::fs::FileType::is_dir`].
+    #[must_use]
     pub fn is_dir(&self) -> bool {
         *self == FileType::Directory
     }
 
-    /// Tests whether this file type represents a symbolic link.
-    pub fn is_symlink(&self) -> bool {
-        *self == FileType::SymbolicLink
-    }
-
     /// Tests whether this file type represents a regular file.
+    /// The result is mutually exclusive to the results of
+    /// [`is_dir`] and [`is_symlink`]; only zero or one of these
+    /// tests may pass.
+    ///   
+    /// This is analogous to [`std::fs::FileType::is_file`].
+    #[must_use]
     pub fn is_file(&self) -> bool {
         *self == FileType::RegularFile
+    }
+
+    /// Tests whether this file type represents a symbolic link.
+    /// The result is mutually exclusive to the results of
+    /// [`is_dir`] and [`is_file`]; only zero or one of these
+    /// tests may pass.
+    ///
+    /// This is analogous to [`std::fs::FileType::is_symlink`].
+    #[must_use]
+    pub fn is_symlink(&self) -> bool {
+        *self == FileType::SymbolicLink
     }
 }
 
